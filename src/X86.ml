@@ -84,14 +84,104 @@ let show instr =
 open SM
 
 (* Symbolic stack machine evaluator
-
      compile : env -> prg -> env * instr list
-
    Take an environment, a stack machine program, and returns a pair --- the updated environment and the list
    of x86 instructions
 *)
-let compile env code = failwith "Not implemented"
-                                
+
+let range n =
+    let rec worker i = if i >= n then [] else i :: (worker (i + 1)) in
+        worker 0
+
+let cmp_suffix op = match op with
+  | "<"  -> "l"
+  | ">"  -> "g"
+  | "<=" -> "le"
+  | ">=" -> "ge"
+  | "==" -> "e"
+  | "!=" -> "ne"
+
+
+let rec compileBinary env operation =
+    let rhs, lhs, env = env#pop2 in
+    let space, env = env#allocate in
+    let zero reg = Binop ("^", reg, reg) in
+    let comparison suffix lhs rhs = [zero eax; Binop ("cmp", rhs, lhs); Set (suffix, "%al"); Mov (eax, space)] in
+    let division treg = [Mov (lhs, eax); zero edx; Cltd; IDiv rhs; Mov(treg, space)] in
+    let instrs = match operation with
+        | "/" -> division(eax)
+        | "%" -> division(edx)
+        | "<" | "<=" | ">" | ">=" | "==" | "!=" -> (match (lhs, rhs) with
+            | (S _, S _) -> [Mov (lhs, edx)] @ comparison (cmp_suffix operation) edx rhs
+            | _          -> comparison (cmp_suffix operation) lhs rhs
+        )
+        | "!!"  -> [zero eax; Mov (lhs, edx); Binop ("!!", rhs, edx); Set ("nz", "%al"); Mov (eax, space)]
+        | "&&"  -> [zero eax; zero edx;
+                    Binop ("cmp", L 0, lhs); Set ("ne", "%al");
+                    Binop ("cmp", L 0, rhs); Set ("ne", "%dl");
+                    Binop ("&&", edx, eax); Mov (eax, space)]
+        | "-"
+        | "+" 
+        | "*"   ->
+           match (lhs, rhs) with
+              | (S _, S _)  -> [Mov (lhs, eax); Binop (operation, rhs, eax); Mov (eax, space)]
+              | _           -> if lhs = space then [Binop (operation, rhs, lhs)] else [Binop (operation, rhs, lhs); Mov (lhs, space)]
+    in env, instrs
+
+let move src dest = match src, dest with
+    | (R _, _) | (L _, _) | (_, R _) -> [Mov (src, dest)]
+    | _                              -> [Mov (src, eax); Mov (eax, dest)]
+
+let p_instr instr n = match instr with
+    | CONST value -> Printf.printf "%d CONST %d\n" n value
+    | LD location -> Printf.printf "%d LD %s\n" n location
+    | ST location -> Printf.printf "%d ST %s\n" n location
+    | READ        -> Printf.printf "%d READ\n" n
+    | WRITE       -> Printf.printf "%d WRITE\n" n
+    | CALL (func, n_args, _) -> Printf.printf "%d CALL %s %d\n" n func n_args
+    | BEGIN (_,_,_) -> Printf.printf "%d BEGIN\n" n
+    | _ -> Printf.printf "%d OTHER\n" n
+
+
+let rec compile env program = match program with
+    | [] -> env, []
+    | instr :: tail ->
+   (*    let p = p_instr instr env#sz in *)
+       let new_env, asm_instrs = (match instr with
+           | CONST value  -> let space, new_env'    = env#allocate     in new_env', [Mov (L value, space)]
+           | LD location  -> let space, new_env'    = env#allocate     in
+                             let variable           = env#loc location in new_env', move variable space
+           | ST location  -> let value, new_env'    = (env#global location)#pop in
+                             let variable           = env#loc location in new_env', (move value variable)
+           | READ         -> let space, new_env'    = env#allocate     in new_env', [Call "Lread"; Mov(eax, space)]
+           | WRITE        -> let variable, new_env' = env#pop          in new_env', [Push variable; Call "Lwrite"; Pop eax]
+           | BINOP op     -> compileBinary env op
+           | JMP target   -> env, [Jmp target]
+           | LABEL value  -> env, [Label value]
+           | CJMP(cond, target) -> let var, newEnv = env#pop in newEnv, [Binop ("cmp",L 0, var); CJmp (cond, target)]
+           | CALL (f, n_args, flag) ->
+                            let folder = (fun (env, args) _ -> let var, env = env#pop in (env, var :: args)) in
+                            let (env, args) = List.fold_left folder (env, []) (range n_args) in
+                            let push_instrs = List.map (fun x -> Push x) args in
+                            let (env, result) = if flag then
+                                                          let (space, new_env) = env#allocate in new_env, [Mov (eax, space)]
+                                                       else
+                                                          env, [] in
+                            env, push_instrs @ [Call f; Binop ("+", (L (n_args * word_size)), esp)] @ result
+           | BEGIN (func, args, locals) -> let push_instrs = List.map (fun x -> Push (R x)) (range num_of_regs) in
+                                   let prolog = [Push ebp; Mov (esp, ebp)] in
+                                   let new_env = env#enter func args locals in
+                                       new_env, prolog @ push_instrs @ [Binop ("-", (M ("$" ^ new_env#lsize)), esp)]
+           | END -> let pop_instrs = List.map (fun x -> Pop (R x)) (range num_of_regs) in
+                    let meta = [Meta (Printf.sprintf "\t.set %s, %d" env#lsize (env#allocated * word_size))] in
+                    let epilogue = [Mov (ebp, esp); Pop ebp; Ret] in
+                        env, [Label env#epilogue] @ pop_instrs @ epilogue @ meta
+           | RET flag -> let ret_move = if flag then (let var, _ = env#pop in [Mov (var, eax)]) else [] in
+                           env, ret_move @ [Jmp env#epilogue]
+       ) in
+       let tail_env, tail_instrs = compile new_env tail in tail_env, (asm_instrs @ tail_instrs)
+
+
 (* A set of strings *)           
 module S = Set.Make (String)
 
@@ -144,7 +234,7 @@ class env =
 
     (* gets a number of stack positions allocated *)
     method allocated = stack_slots                                
-                                
+
     (* enters a function *)
     method enter f a l =
       {< stack_slots = List.length l; stack = []; locals = make_assoc l; args = make_assoc a; fname = f >}
@@ -185,4 +275,4 @@ let build prog name =
   close_out outf;
   let inc = try Sys.getenv "RC_RUNTIME" with _ -> "../runtime" in
   Sys.command (Printf.sprintf "gcc -m32 -o %s %s/runtime.o %s.s" name inc name)
- 
+
